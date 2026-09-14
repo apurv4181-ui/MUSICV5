@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import aiohttp
 import urllib.parse
+import re
 from PIL import Image
 from pyrogram import filters, types
 from anony import app
@@ -17,8 +18,12 @@ _MAX_RESPONSE_BYTES = 15 * 1024 * 1024
 # Number info API
 _NUM_API_URL = "https://apurv-num-info-api.prathmeshapis.workers.dev/"
 
-# Claude AI API
-_CLAUDE_API_URL = "http://de3.bot-hosting.net:21007/kilwa-claude"
+# AI API providers
+_CLAUDE_API_URL = "https://kilwaapi.vercel.app/kilwa-claude"
+_GROK_API_URL = "https://kilwaapi.vercel.app/kilwa-grok"
+
+# Per-user AI provider preference (default: claude)
+user_ai_provider = {}
 
 
 async def _fetch_generated_image(prompt: str) -> BytesIO:
@@ -40,8 +45,6 @@ async def _fetch_generated_image(prompt: str) -> BytesIO:
     if not image_data or len(image_data) > _MAX_RESPONSE_BYTES:
         raise RuntimeError("image response is empty or too large")
 
-    # The endpoint returns WebP. Convert it to PNG for a reliable Telegram
-    # photo upload while keeping the image entirely in memory.
     with Image.open(BytesIO(image_data)) as image:
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGBA")
@@ -51,6 +54,158 @@ async def _fetch_generated_image(prompt: str) -> BytesIO:
         output.seek(0)
         output.name = "generated.png"
         return output
+
+
+async def _query_ai(api_url: str, query: str) -> str | None:
+    """Query an AI API endpoint and return the reply text."""
+    encoded_query = urllib.parse.quote(query)
+    full_url = f"{api_url}?text={encoded_query}"
+
+    timeout = aiohttp.ClientTimeout(total=60)
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(full_url) as response:
+                if response.status != 200:
+                    return None
+
+                response_text = await response.text()
+
+        try:
+            data = json.loads(response_text)
+
+            if data.get("status") != "success":
+                return None
+
+            reply = data.get("reply", "")
+
+            if reply:
+                return reply.strip()
+
+        except json.JSONDecodeError:
+            if '"reply"' in response_text:
+                try:
+                    start_idx = response_text.find('"reply":') + 8
+                    while start_idx < len(response_text) and response_text[start_idx] in ' \t\n"':
+                        start_idx += 1
+                    end_idx = response_text.find('"', start_idx)
+                    if end_idx > start_idx:
+                        return response_text[start_idx:end_idx].strip()
+                except Exception:
+                    pass
+
+        return None
+
+    except Exception:
+        return None
+
+
+def _format_stylish_response(text: str) -> str:
+    """
+    Format the AI response in a stylish, clean way for Telegram HTML.
+
+    - Converts markdown code blocks to <pre><code> blocks
+    - Converts inline `code` to <code>
+    - Converts **bold** to <b>
+    - Converts *italic* / _italic_ to <i>
+    - Removes markdown headers (###) and turns them into bold lines
+    - Fixes bullet points and numbered lists
+    - Escapes HTML safely
+    """
+    if not text:
+        return ""
+
+    # First, escape HTML so user content can't break formatting
+    text = escape(text)
+
+    # ---- Code blocks: ```lang\n...\n``` -> <pre><code>...</code></pre> ----
+    def _code_block(match):
+        lang = match.group(1).strip()
+        code = match.group(2)
+        # Remove leading newline inside the code block
+        if code.startswith("\n"):
+            code = code[1:]
+        # Trim trailing newlines
+        code = code.rstrip("\n")
+        return f"<pre><code>{code}</code></pre>"
+
+    text = re.sub(r"```([a-zA-Z0-9_+-]*)\n(.*?)```", _code_block, text, flags=re.DOTALL)
+
+    # ---- Inline code: `code` -> <code>code</code> ----
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+
+    # ---- Headers: ### Header / ## Header / # Header -> bold line ----
+    text = re.sub(r"^#{1,6}\s*(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # ---- Bold: **text** -> <b>text</b> ----
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+
+    # ---- Italic: *text* -> <i>text</i> (careful: avoid touching bullets) ----
+    text = re.sub(r"(?<![\*\w])\*([^\*\n]+?)\*(?![\*\w])", r"<i>\1</i>", text)
+
+    # ---- Italic: _text_ -> <i>text</i> ----
+    text = re.sub(r"(?<![_\w])_([^_\n]+?)_(?![_\w])", r"<i>\1</i>", text)
+
+    # ---- Strikethrough: ~~text~~ -> <s>text</s> ----
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
+
+    # ---- Bullet points: convert "- " / "* " at line start to a nicer bullet ----
+    text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
+
+    # ---- Numbered lists: "1. " stays, just make it neat ----
+    text = re.sub(r"^(\d+)\.\s+", r"\1. ", text, flags=re.MULTILINE)
+
+    # ---- Collapse 3+ blank lines into 2 (cleaner look) ----
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # ---- Trim leading/trailing whitespace ----
+    text = text.strip()
+
+    return text
+
+
+def _split_message(text: str, limit: int = 4000) -> list[str]:
+    """
+    Split a long message into chunks that respect <pre> blocks if possible.
+    A simple splitter: prefer to split on double newlines.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        # Try to find a good split point
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+async def _send_stylish(_, m: types.Message, reply: str, source_name: str = None) -> None:
+    """Send the AI reply in a clean, stylish format (split if needed)."""
+    formatted = _format_stylish_response(reply)
+
+    header = "🤖 <b>AI Response</b>"
+    if source_name:
+        header = f"🤖 <b>{source_name}</b>"
+
+    full_text = f"{header}\n━━━━━━━━━━━━━━━━━━━━\n\n{formatted}"
+
+    chunks = _split_message(full_text, limit=4000)
+
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await m.reply_text(chunk, quote=True, disable_web_page_preview=True)
+        else:
+            await m.reply_text(chunk, quote=False, disable_web_page_preview=True)
 
 
 @app.on_message(filters.command("img") & ~app.bl_users)
@@ -98,7 +253,6 @@ async def number_search(_, m: types.Message) -> None:
 
     mobile_number = m.command[1].strip()
 
-    # Basic validation
     if not mobile_number.isdigit() or len(mobile_number) < 10:
         await m.reply_text(
             "❌ <b>Invalid mobile number.</b>\n"
@@ -113,7 +267,6 @@ async def number_search(_, m: types.Message) -> None:
     )
 
     try:
-        # Call the API
         full_url = f"{_NUM_API_URL}?mobile={mobile_number}"
 
         async with aiohttp.ClientSession() as session:
@@ -127,14 +280,12 @@ async def number_search(_, m: types.Message) -> None:
 
                 response_text = await response.text()
 
-        # Parse JSON
         try:
             data = json.loads(response_text)
         except json.JSONDecodeError:
             await status.edit_text("❌ <b>Invalid response from API.</b>")
             return
 
-        # Extract only the 'result' field
         result = data.get("result")
 
         if result is None:
@@ -148,10 +299,7 @@ async def number_search(_, m: types.Message) -> None:
             await status.edit_text(f"📱 <b>No information found for {mobile_number}</b>")
             return
 
-        # Format the result
         formatted_result = format_number_result(result, mobile_number)
-
-        # Send the formatted result
         await status.edit_text(formatted_result)
 
     except Exception as e:
@@ -163,87 +311,134 @@ async def number_search(_, m: types.Message) -> None:
 
 @app.on_message(filters.command("ai") & ~app.bl_users)
 async def claude_ai(_, m: types.Message) -> None:
-    """Chat with Claude AI."""
+    """Chat with Claude AI (with Grok fallback)."""
+    chat_id = m.chat.id
+
     if len(m.command) < 2:
         await m.reply_text(
-            "🤖 <b>Usage:</b> <code>/ai your question here</code>\n"
-            "Example: <code>/ai What is the meaning of life?</code>",
+            "🤖 <b>Claude AI</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<b>Usage:</b> <code>/ai your question here</code>\n"
+            "<b>Example:</b> <code>/ai What is the meaning of life?</code>\n\n"
+            "💡 <i>Switches to Claude and answers.</i>",
             quote=True,
         )
         return
 
+    user_ai_provider[chat_id] = "claude"
     query = " ".join(m.command[1:]).strip()
+    await _handle_ai_query(m, query, provider="claude")
 
+
+@app.on_message(filters.command("grok") & ~app.bl_users)
+async def grok_ai(_, m: types.Message) -> None:
+    """Chat with Grok AI (with Claude fallback)."""
+    chat_id = m.chat.id
+
+    if len(m.command) < 2:
+        await m.reply_text(
+            "🌌 <b>Grok AI</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<b>Usage:</b> <code>/grok your question here</code>\n"
+            "<b>Example:</b> <code>/grok Tell me a joke</code>\n\n"
+            "💡 <i>Switches to Grok and answers.</i>",
+            quote=True,
+        )
+        return
+
+    user_ai_provider[chat_id] = "grok"
+    query = " ".join(m.command[1:]).strip()
+    await _handle_ai_query(m, query, provider="grok")
+
+
+@app.on_message(filters.command("switch") & ~app.bl_users)
+async def switch_provider(_, m: types.Message) -> None:
+    """Show or switch the current AI provider."""
+    chat_id = m.chat.id
+    current = user_ai_provider.get(chat_id, "claude")
+
+    if len(m.command) > 1:
+        choice = m.command[1].strip().lower()
+        if choice in ("claude", "ai"):
+            user_ai_provider[chat_id] = "claude"
+            await m.reply_text(
+                "✅ <b>Switched to Claude</b>\n"
+                "Use <code>/ai &lt;question&gt;</code> to chat.",
+                quote=True,
+            )
+        elif choice in ("grok", "g"):
+            user_ai_provider[chat_id] = "grok"
+            await m.reply_text(
+                "✅ <b>Switched to Grok</b>\n"
+                "Use <code>/grok &lt;question&gt;</code> to chat.",
+                quote=True,
+            )
+        else:
+            await m.reply_text(
+                "❌ Unknown provider. Use <code>/switch claude</code> or <code>/switch grok</code>.",
+                quote=True,
+            )
+        return
+
+    await m.reply_text(
+        f"🤖 <b>Current provider:</b> <code>{current}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>Switch with:</b>\n"
+        "▪ <code>/switch claude</code>\n"
+        "▪ <code>/switch grok</code>\n\n"
+        "<b>Or use directly:</b>\n"
+        "▪ <code>/ai &lt;question&gt;</code>\n"
+        "▪ <code>/grok &lt;question&gt;</code>",
+        quote=True,
+    )
+
+
+async def _handle_ai_query(m: types.Message, query: str, provider: str) -> None:
+    """Handle AI query with fallback to the other provider."""
     status = await m.reply_text(
         "🤖 <b>Thinking...</b>",
         quote=True,
     )
 
-    try:
-        # URL encode the query
-        encoded_query = urllib.parse.quote(query)
-        full_url = f"{_CLAUDE_API_URL}?text={encoded_query}"
+    if provider == "claude":
+        primary_url = _CLAUDE_API_URL
+        fallback_url = _GROK_API_URL
+        primary_name = "Claude"
+        fallback_name = "Grok"
+    else:
+        primary_url = _GROK_API_URL
+        fallback_url = _CLAUDE_API_URL
+        primary_name = "Grok"
+        fallback_name = "Claude"
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(full_url, timeout=60) as response:
-                if response.status != 200:
-                    await status.edit_text(
-                        f"❌ <b>API Error.</b>\n"
-                        f"Status: {response.status}"
-                    )
-                    return
+    reply = await _query_ai(primary_url, query)
+    used_provider = primary_name
 
-                response_text = await response.text()
-
-        # Try to parse JSON response
+    if not reply:
         try:
-            data = json.loads(response_text)
+            await status.edit_text(
+                f"⚠️ <b>{primary_name} failed.</b>\n"
+                f"<i>Trying {fallback_name}...</i>"
+            )
+        except Exception:
+            pass
+        reply = await _query_ai(fallback_url, query)
+        used_provider = fallback_name
 
-            # Extract only the reply field
-            reply = data.get("reply", "")
-
-            if not reply:
-                await status.edit_text("❌ <b>No response received from AI.</b>")
-                return
-
-            # Format the response - ONLY THE REPLY, NO MODEL INFO
-            formatted_response = f"🤖 <b>Response:</b>\n\n{escape(reply)}"
-
-            # Split long messages if needed (Telegram has 4096 char limit)
-            if len(formatted_response) > 4096:
-                # Send in parts
-                await status.edit_text(formatted_response[:4096])
-                remaining = formatted_response[4096:]
-                while remaining:
-                    await m.reply_text(remaining[:4096], quote=True)
-                    remaining = remaining[4096:]
-            else:
-                await status.edit_text(formatted_response)
-
-        except json.JSONDecodeError:
-            # If not JSON, try to extract just the reply from plain text
-            if "reply" in response_text:
-                try:
-                    start_idx = response_text.find('"reply":') + 9
-                    end_idx = response_text.find('"', start_idx)
-                    if start_idx > 8 and end_idx > start_idx:
-                        reply = response_text[start_idx:end_idx]
-                        await status.edit_text(f"🤖 <b>Response:</b>\n\n{escape(reply)}")
-                        return
-                except:
-                    pass
-
-            # If it's plain text response
-            if len(response_text) > 4000:
-                await status.edit_text(response_text[:4000] + "...\n\n<i>(Response truncated)</i>")
-            else:
-                await status.edit_text(f"🤖 <b>Response:</b>\n\n{escape(response_text)}")
-
-    except Exception as e:
+    if not reply:
         await status.edit_text(
-            f"❌ <b>An error occurred.</b>\n"
-            f"Error: {str(e)[:100]}"
+            "❌ <b>Both providers failed.</b>\n"
+            "Please try again in a moment."
         )
+        return
+
+    # Delete the "Thinking..." status, then send formatted response
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    await _send_stylish(_, m, reply, source_name=used_provider)
 
 
 def format_number_result(result, mobile_number):

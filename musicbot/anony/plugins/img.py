@@ -121,12 +121,10 @@ def _format_stylish_response(text: str) -> str:
 
     # ---- Code blocks: ```lang\n...\n``` -> <pre><code>...</code></pre> ----
     def _code_block(match):
-        lang = match.group(1).strip()
         code = match.group(2)
         # Remove leading newline inside the code block
         if code.startswith("\n"):
             code = code[1:]
-        # Trim trailing newlines
         code = code.rstrip("\n")
         return f"<pre><code>{code}</code></pre>"
 
@@ -141,7 +139,7 @@ def _format_stylish_response(text: str) -> str:
     # ---- Bold: **text** -> <b>text</b> ----
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
 
-    # ---- Italic: *text* -> <i>text</i> (careful: avoid touching bullets) ----
+    # ---- Italic: *text* -> <i>text</i> ----
     text = re.sub(r"(?<![\*\w])\*([^\*\n]+?)\*(?![\*\w])", r"<i>\1</i>", text)
 
     # ---- Italic: _text_ -> <i>text</i> ----
@@ -150,13 +148,10 @@ def _format_stylish_response(text: str) -> str:
     # ---- Strikethrough: ~~text~~ -> <s>text</s> ----
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text, flags=re.DOTALL)
 
-    # ---- Bullet points: convert "- " / "* " at line start to a nicer bullet ----
+    # ---- Bullet points: "- " / "* " at line start to nicer bullet ----
     text = re.sub(r"^[\-\*]\s+", "• ", text, flags=re.MULTILINE)
 
-    # ---- Numbered lists: "1. " stays, just make it neat ----
-    text = re.sub(r"^(\d+)\.\s+", r"\1. ", text, flags=re.MULTILINE)
-
-    # ---- Collapse 3+ blank lines into 2 (cleaner look) ----
+    # ---- Collapse 3+ blank lines into 2 ----
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     # ---- Trim leading/trailing whitespace ----
@@ -166,17 +161,13 @@ def _format_stylish_response(text: str) -> str:
 
 
 def _split_message(text: str, limit: int = 4000) -> list[str]:
-    """
-    Split a long message into chunks that respect <pre> blocks if possible.
-    A simple splitter: prefer to split on double newlines.
-    """
+    """Split a long message into chunks that respect paragraph breaks."""
     if len(text) <= limit:
         return [text]
 
     chunks = []
     remaining = text
     while len(remaining) > limit:
-        # Try to find a good split point
         split_at = remaining.rfind("\n\n", 0, limit)
         if split_at == -1 or split_at < limit // 2:
             split_at = remaining.rfind("\n", 0, limit)
@@ -189,7 +180,7 @@ def _split_message(text: str, limit: int = 4000) -> list[str]:
     return chunks
 
 
-async def _send_stylish(_, m: types.Message, reply: str, source_name: str = None) -> None:
+async def _send_stylish(m: types.Message, reply: str, source_name: str = None) -> None:
     """Send the AI reply in a clean, stylish format (split if needed)."""
     formatted = _format_stylish_response(reply)
 
@@ -206,6 +197,54 @@ async def _send_stylish(_, m: types.Message, reply: str, source_name: str = None
             await m.reply_text(chunk, quote=True, disable_web_page_preview=True)
         else:
             await m.reply_text(chunk, quote=False, disable_web_page_preview=True)
+
+
+async def _handle_ai_query(m: types.Message, query: str, provider: str) -> None:
+    """Handle AI query with fallback to the other provider."""
+    status = await m.reply_text(
+        "🤖 <b>Thinking...</b>",
+        quote=True,
+    )
+
+    if provider == "claude":
+        primary_url = _CLAUDE_API_URL
+        fallback_url = _GROK_API_URL
+        primary_name = "Claude"
+        fallback_name = "Grok"
+    else:
+        primary_url = _GROK_API_URL
+        fallback_url = _CLAUDE_API_URL
+        primary_name = "Grok"
+        fallback_name = "Claude"
+
+    reply = await _query_ai(primary_url, query)
+    used_provider = primary_name
+
+    if not reply:
+        try:
+            await status.edit_text(
+                f"⚠️ <b>{primary_name} failed.</b>\n"
+                f"<i>Trying {fallback_name}...</i>"
+            )
+        except Exception:
+            pass
+        reply = await _query_ai(fallback_url, query)
+        used_provider = fallback_name
+
+    if not reply:
+        await status.edit_text(
+            "❌ <b>Both providers failed.</b>\n"
+            "Please try again in a moment."
+        )
+        return
+
+    # Delete "Thinking..." status, then send formatted response
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    await _send_stylish(m, reply, source_name=used_provider)
 
 
 @app.on_message(filters.command("img") & ~app.bl_users)
@@ -391,54 +430,6 @@ async def switch_provider(_, m: types.Message) -> None:
         "▪ <code>/grok &lt;question&gt;</code>",
         quote=True,
     )
-
-
-async def _handle_ai_query(m: types.Message, query: str, provider: str) -> None:
-    """Handle AI query with fallback to the other provider."""
-    status = await m.reply_text(
-        "🤖 <b>Thinking...</b>",
-        quote=True,
-    )
-
-    if provider == "claude":
-        primary_url = _CLAUDE_API_URL
-        fallback_url = _GROK_API_URL
-        primary_name = "Claude"
-        fallback_name = "Grok"
-    else:
-        primary_url = _GROK_API_URL
-        fallback_url = _CLAUDE_API_URL
-        primary_name = "Grok"
-        fallback_name = "Claude"
-
-    reply = await _query_ai(primary_url, query)
-    used_provider = primary_name
-
-    if not reply:
-        try:
-            await status.edit_text(
-                f"⚠️ <b>{primary_name} failed.</b>\n"
-                f"<i>Trying {fallback_name}...</i>"
-            )
-        except Exception:
-            pass
-        reply = await _query_ai(fallback_url, query)
-        used_provider = fallback_name
-
-    if not reply:
-        await status.edit_text(
-            "❌ <b>Both providers failed.</b>\n"
-            "Please try again in a moment."
-        )
-        return
-
-    # Delete the "Thinking..." status, then send formatted response
-    try:
-        await status.delete()
-    except Exception:
-        pass
-
-    await _send_stylish(_, m, reply, source_name=used_provider)
 
 
 def format_number_result(result, mobile_number):

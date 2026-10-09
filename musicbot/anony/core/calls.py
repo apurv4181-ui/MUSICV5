@@ -19,7 +19,7 @@ import re
 from anony import (app, config, db, lang, logger,
                    queue, thumb, userbot, yt)
 from anony.helpers import Media, Track, buttons, utils
-from anony.helpers._api import NexGenApi, ShrutiApi, extract_video_id
+from anony.helpers._api import NexGenApi, YukiApi, extract_video_id
 from backend_prefs import get_primary
 
 # Initialize backend API helper clients
@@ -29,9 +29,10 @@ nexgen_client = NexGenApi(
     video_api_url=getattr(config, "VIDEO_API_URL", "") or getattr(config, "NEXGEN_VIDEO_API_URL", ""),
 )
 
-shruti_client = ShrutiApi(
-    api_url=getattr(config, "SHRUTI_API_URL", ""),
-    api_key=getattr(config, "SHRUTI_API_KEY", ""),
+yuki_client = YukiApi(
+    api_key=getattr(config, "YUKI_API_KEY", "") or "yuki_9c29d8e669f4a0ad9577d1f99818e420",
+    primary_url=getattr(config, "YUKI_PRIMARY_URL", "") or "https://music.yukiapi.site",
+    backup_url=getattr(config, "YUKI_BACKUP_URL", "") or "https://play.yukiapi.site",
 )
 
 
@@ -41,10 +42,10 @@ async def _nexgen_get_stream_link(vid_id: str, video: bool = False, timeout: int
     return await nexgen_client.download(clean_id, video=video)
 
 
-async def _shruti_get_stream_link(vid_id: str, video: bool = False, timeout: int = 20, poll_interval: int = 3) -> Optional[str]:
-    """Downloads file locally using ShrutiApi and returns local file path."""
+async def _yuki_get_stream_link(vid_id: str, video: bool = False, timeout: int = 20, poll_interval: int = 3) -> Optional[str]:
+    """Downloads file locally using YukiApi (primary -> backup failover) and returns local file path."""
     clean_id = extract_video_id(vid_id)
-    return await shruti_client.download(clean_id, video=video)
+    return await yuki_client.download(clean_id, video=video)
 
 
 async def _nubcoders_get_stream_link(video_id_or_url: str, timeout: int = 15) -> Optional[str]:
@@ -394,13 +395,13 @@ class TgCall(PyTgCalls):
                 media_id = extract_video_id(media.id or getattr(media, "url", ""))
 
                 stream_link = None
-                if mode in ("s", "shruti"):
-                    stream_link = await _shruti_get_stream_link(media_id, video=getattr(media, "video", False), timeout=15, poll_interval=3)
+                if mode in ("yuki", "yk", "shruti", "s"):
+                    stream_link = await _yuki_get_stream_link(media_id, video=getattr(media, "video", False), timeout=15, poll_interval=3)
                     if stream_link:
                         media.file_path = stream_link
-                        logger.info("Downloaded via Shruti API for %s", media_id)
+                        logger.info("Downloaded via Yuki API for %s", media_id)
                     else:
-                        logger.warning("Shruti backend failed, falling back to download for %s", media_id)
+                        logger.warning("Yuki backend failed, falling back to download for %s", media_id)
                 elif mode in ("n", "nub", "nubcoders"):
                     stream_link = await _nubcoders_get_stream_link(media_id, timeout=15)
                     if stream_link:

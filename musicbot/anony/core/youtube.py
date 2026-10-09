@@ -22,8 +22,12 @@ JIOSAVAN_API_URL = os.getenv("JIOSAVAN_API_URL", "").rstrip("/")
 NEXGEN_API_URL = getattr(config, "API_URL", os.getenv("API_URL", "https://pvtz.nexgenbots.xyz")).rstrip("/")
 NEXGEN_VIDEO_API_URL = getattr(config, "VIDEO_API_URL", os.getenv("VIDEO_API_URL", "https://api.video.nexgenbots.xyz")).rstrip("/")
 NEXGEN_API_KEY = getattr(config, "API_KEY", os.getenv("API_KEY", ""))
-SHRUTI_API_URL = getattr(config, "SHRUTI_API_URL", os.getenv("SHRUTI_API_URL", "https://api.shrutibots.site")).rstrip("/")
-SHRUTI_API_KEY = getattr(config, "SHRUTI_API_KEY", os.getenv("SHRUTI_API_KEY", ""))
+
+# --- Yuki Music API (replaces Shruti) --------------------------------------------
+YUKI_API_KEY = getattr(config, "YUKI_API_KEY", os.getenv("YUKI_API_KEY", "yuki_9c29d8e669f4a0ad9577d1f99818e420"))
+YUKI_PRIMARY_URL = getattr(config, "YUKI_PRIMARY_URL", os.getenv("YUKI_PRIMARY_URL", "https://music.yukiapi.site")).rstrip("/")
+YUKI_BACKUP_URL = getattr(config, "YUKI_BACKUP_URL", os.getenv("YUKI_BACKUP_URL", "https://play.yukiapi.site")).rstrip("/")
+
 # New provider: NubCoders (stream resolver)
 NUBCODERS_API_URL = getattr(config, "NUBCODERS_API_URL", os.getenv("NUBCODERS_API_URL", "https://api.nubcoders.com")).rstrip("/")
 NUBCODERS_TOKEN = getattr(config, "NUBCODERS_TOKEN", os.getenv("NUBCODERS_TOKEN", ""))
@@ -93,7 +97,7 @@ async def _jiosaavn_download(song_id: str) -> Optional[str]:
         return None
 
 
-# ----------------- NexGenBots integration (replaces Arc flow) ----------------------
+# ----------------- NexGenBots integration -----------------------------------------
 
 _nexgen_client: Optional[NexGenApi] = None
 
@@ -127,7 +131,122 @@ async def _nexgen_download(video_id: str, is_video: bool = False) -> Optional[st
         return None
 
 
-# ----------------- NubCoders provider (new) --------------------------------------
+# ----------------- Yuki Music API (replaces Shruti) -------------------------------
+
+def _yuki_stream_url(video_id: str, base: str, is_video: bool = False) -> str:
+    """Build a Yuki stream URL for the given base gateway."""
+    media_type = "video" if is_video else "audio"
+    return f"{base.rstrip('/')}/stream/{video_id}?key={YUKI_API_KEY}&type={media_type}"
+
+
+async def _yuki_get_stream_link(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
+    """
+    Return the working Yuki stream URL (primary first, then backup failover).
+    Does NOT download — just validates which gateway responds.
+    """
+    if not YUKI_API_KEY:
+        logger.warning("Yuki config missing: YUKI_API_KEY not set")
+        return None
+
+    vid = extract_video_id(video_id_or_url)
+    if not vid:
+        return None
+
+    gateways = [YUKI_PRIMARY_URL, YUKI_BACKUP_URL]
+    for base in gateways:
+        if not base:
+            continue
+        url = _yuki_stream_url(vid, base, is_video=is_video)
+        try:
+            async with aiohttp.ClientSession() as session:
+                # HEAD-style probe: only fetch headers, don't download body
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status in (200, 206):
+                        logger.info("Yuki stream OK via %s for %s", base, vid)
+                        return url
+                    logger.warning("Yuki gateway %s returned HTTP %s for %s", base, resp.status, vid)
+        except Exception as e:
+            logger.warning("Yuki gateway %s error for %s: %s", base, vid, e)
+            continue
+    return None
+
+
+async def _yuki_download(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
+    """
+    Download from Yuki API with automatic primary -> backup failover.
+    Saves to DOWNLOAD_DIR and returns the local path.
+    """
+    if not YUKI_API_KEY:
+        logger.warning("Yuki config missing: YUKI_API_KEY not set")
+        return None
+
+    vid = extract_video_id(video_id_or_url)
+    if not vid:
+        return None
+
+    ext = "mp4" if is_video else "m4a"
+    filename = str(DOWNLOAD_DIR / f"{vid}.{ext}")
+
+    gateways = [YUKI_PRIMARY_URL, YUKI_BACKUP_URL]
+    for base in gateways:
+        if not base:
+            continue
+        stream_url = _yuki_stream_url(vid, base, is_video=is_video)
+        logger.info("Yuki download trying: %s (type: %s)", stream_url, "video" if is_video else "audio")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    stream_url,
+                    timeout=aiohttp.ClientTimeout(total=300),
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.warning("Yuki HTTP %s via %s for %s: %s", resp.status, base, vid, text[:200])
+                        continue
+
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    # If API returns JSON (some deployments do), extract the direct link
+                    if "application/json" in ctype:
+                        try:
+                            data = await resp.json()
+                            link = data.get("url") or data.get("link") or data.get("stream") or data.get("stream_url")
+                            if link:
+                                if link.startswith("/"):
+                                    from urllib.parse import urljoin
+                                    link = urljoin(base, link)
+                                out = await _download_via_url_to_file(link, filename)
+                                if out:
+                                    return out
+                        except Exception as e:
+                            logger.debug("Yuki JSON parse error: %s", e)
+                        continue
+
+                    # Stream binary content directly to disk
+                    with open(filename, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(131072):
+                            if chunk:
+                                f.write(chunk)
+
+            if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                size_mb = os.path.getsize(filename) / (1024 * 1024)
+                logger.info("Yuki download successful via %s: %s (%.2f MB)", base, filename, size_mb)
+                return filename
+            else:
+                logger.warning("Yuki download empty file via %s for %s", base, vid)
+        except Exception as e:
+            logger.warning("Yuki download error via %s for %s: %s", base, vid, e)
+            continue
+
+    logger.warning("Yuki: all gateways failed for %s", vid)
+    return None
+
+
+# ----------------- NubCoders provider ---------------------------------------------
 
 async def _nubcoders_get_stream_link(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
     """Return a direct stream URL from NubCoders /info without downloading."""
@@ -176,64 +295,6 @@ async def _nubcoders_download(video_id_or_url: str, is_video: bool = False) -> O
         out = await _download_via_url_to_file(stream, filename)
         return out
     except Exception:
-        return None
-
-
-# ----------------- Shruti API integration ----------------------
-
-async def _shruti_download(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
-    """Download from Shruti API using clean 11-char ID."""
-    if not SHRUTI_API_URL or not SHRUTI_API_KEY:
-        logger.warning("Shruti config missing: SHRUTI_API_URL or SHRUTI_API_KEY not set")
-        return None
-
-    try:
-        vid = extract_video_id(video_id_or_url)
-        media_type = "video" if is_video else "audio"
-        ext = "mp4" if is_video else "m4a"
-        filename = str(DOWNLOAD_DIR / f"{vid}.{ext}")
-
-        endpoint = f"{SHRUTI_API_URL.rstrip('/')}/download"
-        params = {"url": vid, "type": media_type, "api_key": SHRUTI_API_KEY}
-
-        logger.info("Shruti download starting: %s (type: %s) -> %s", vid, media_type, endpoint)
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(endpoint, params=params, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.warning("Shruti download HTTP %s for %s: %s", resp.status, vid, text)
-                    return None
-
-                ctype = resp.headers.get("Content-Type", "")
-                if "application/json" in (ctype or ""):
-                    try:
-                        data = await resp.json()
-                        link = data.get("link") or data.get("url") or None
-                        if link:
-                            if link.startswith("/"):
-                                from urllib.parse import urljoin
-                                link = urljoin(SHRUTI_API_URL, link)
-                            out = await _download_via_url_to_file(link, filename)
-                            return out
-                    except Exception as e:
-                        logger.debug("Shruti JSON parse error while downloading: %s", e)
-
-                with open(filename, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(131072):
-                        if chunk:
-                            f.write(chunk)
-
-        if os.path.exists(filename) and os.path.getsize(filename) > 0:
-            size_mb = os.path.getsize(filename) / (1024 * 1024)
-            logger.info("Shruti download successful: %s (%.2f MB)", filename, size_mb)
-            return filename
-        else:
-            logger.warning("Shruti download resulted in empty file for %s", vid)
-            return None
-
-    except Exception as e:
-        logger.warning("Shruti download error for %s: %s", video_id_or_url, e)
         return None
 
 
@@ -466,8 +527,6 @@ class YouTube:
 
     def invalid(self, url: str) -> bool:
         # FIX: this must be the logical negation of valid(), not a duplicate of it.
-        # Previously this returned True for VALID urls too, which caused checkUB()
-        # to reject every legitimate YouTube link with "play_not_found".
         return not bool(re.match(self.regex, url))
 
     async def search(self, query: str, m_id: int, video: bool = False) -> Optional[Track]:
@@ -543,13 +602,13 @@ class YouTube:
             logger.warning("NexGen download failed [yt/nexgen] for: %s", vid_for_file)
             return None
 
-        # 3) Shruti API (/s)
-        if mode in ("s", "shruti"):
-            out = await _shruti_download(vid_for_file, is_video=video)
+        # 3) Yuki Music API (/yuki or /y or legacy /s, /shruti aliases)
+        if mode in ("yuki", "yk", "shruti", "s"):
+            out = await _yuki_download(vid_for_file, is_video=video)
             if out:
                 _schedule_delete(out)
                 return out
-            logger.warning("Shruti download failed [s/shruti] for: %s", vid_for_file)
+            logger.warning("Yuki download failed [yuki] for: %s", vid_for_file)
             return None
 
         # 4) NubCoders (/n) - Direct Stream Link or Local Download
@@ -564,7 +623,7 @@ class YouTube:
             logger.warning("NubCoders download failed [nub] for: %s", vid_for_file)
             return None
 
-        # 5) Auto Mode (/auto) - Fallback Sequence: Telegram CDN -> Shruti -> NubCoders -> yt-dlp
+        # 5) Auto Mode (/auto) - Fallback Sequence: Telegram CDN -> Yuki -> NubCoders -> yt-dlp
         if mode == "auto":
             tg_file = await _tg_channel_download_by_id(vid_for_file, is_video=video)
             if tg_file:
@@ -576,10 +635,10 @@ class YouTube:
                     _schedule_delete(tg_file_t)
                     return tg_file_t
 
-            shruti_out = await _shruti_download(vid_for_file, is_video=video)
-            if shruti_out:
-                _schedule_delete(shruti_out)
-                return shruti_out
+            yuki_out = await _yuki_download(vid_for_file, is_video=video)
+            if yuki_out:
+                _schedule_delete(yuki_out)
+                return yuki_out
 
             nub_stream = await _nubcoders_get_stream_link(vid_for_file, is_video=video)
             if nub_stream:
@@ -599,6 +658,11 @@ class YouTube:
             if os.path.exists(out):
                 _schedule_delete(out)
             return out
+
+        yuki_out = await _yuki_download(vid_for_file, is_video=video)
+        if yuki_out:
+            _schedule_delete(yuki_out)
+            return yuki_out
 
         tg_file = await _tg_channel_download_by_id(vid_for_file, is_video=video)
         if tg_file:

@@ -7,7 +7,6 @@ requires-python = ">=3.10"
 
 dependencies = [
     "aiofiles",
-    "yt-dlp",
     "aiohttp~=3.14.1",
     "kurigram>=2.2.21",
     "pillow~=12.2.0",
@@ -18,4 +17,5 @@ dependencies = [
     "pytgcrypto>=1.2.11",
     "python-dotenv~=1.2.1",
     "ytmusicapi~=1.12.2",
+    "yt-dlp>=2024.12.0",
 ]

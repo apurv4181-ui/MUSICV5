@@ -14,7 +14,7 @@ from py_yt import Playlist, VideosSearch
 
 from anony import logger, app, config, userbot
 from anony.helpers import Track, utils
-from anony.helpers._api import NexGenApi
+from anony.helpers._api import NexGenApi, YukiApi
 from backend_prefs import get_primary
 
 # Config / defaults
@@ -133,117 +133,51 @@ async def _nexgen_download(video_id: str, is_video: bool = False) -> Optional[st
 
 # ----------------- Yuki Music API (replaces Shruti) -------------------------------
 
-def _yuki_stream_url(video_id: str, base: str, is_video: bool = False) -> str:
-    """Build a Yuki stream URL for the given base gateway."""
-    media_type = "video" if is_video else "audio"
-    return f"{base.rstrip('/')}/stream/{video_id}?key={YUKI_API_KEY}&type={media_type}"
+_yuki_client: Optional[YukiApi] = None
 
 
-async def _yuki_get_stream_link(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
-    """
-    Return the working Yuki stream URL (primary first, then backup failover).
-    Does NOT download — just validates which gateway responds.
-    """
+async def _get_yuki_client() -> Optional[YukiApi]:
+    global _yuki_client
+    if _yuki_client:
+        return _yuki_client
     if not YUKI_API_KEY:
         logger.warning("Yuki config missing: YUKI_API_KEY not set")
         return None
-
-    vid = extract_video_id(video_id_or_url)
-    if not vid:
-        return None
-
-    gateways = [YUKI_PRIMARY_URL, YUKI_BACKUP_URL]
-    for base in gateways:
-        if not base:
-            continue
-        url = _yuki_stream_url(vid, base, is_video=is_video)
-        try:
-            async with aiohttp.ClientSession() as session:
-                # HEAD-style probe: only fetch headers, don't download body
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                ) as resp:
-                    if resp.status in (200, 206):
-                        logger.info("Yuki stream OK via %s for %s", base, vid)
-                        return url
-                    logger.warning("Yuki gateway %s returned HTTP %s for %s", base, resp.status, vid)
-        except Exception as e:
-            logger.warning("Yuki gateway %s error for %s: %s", base, vid, e)
-            continue
-    return None
+    _yuki_client = YukiApi(
+        api_key=YUKI_API_KEY,
+        primary_url=YUKI_PRIMARY_URL,
+        backup_url=YUKI_BACKUP_URL,
+    )
+    try:
+        await _yuki_client.get_session()
+    except Exception as e:
+        logger.warning("Failed to create Yuki session: %s", e)
+        _yuki_client = None
+    return _yuki_client
 
 
 async def _yuki_download(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
-    """
-    Download from Yuki API with automatic primary -> backup failover.
-    Saves to DOWNLOAD_DIR and returns the local path.
-    """
-    if not YUKI_API_KEY:
-        logger.warning("Yuki config missing: YUKI_API_KEY not set")
+    client = await _get_yuki_client()
+    if not client:
+        return None
+    try:
+        vid = extract_video_id(video_id_or_url)
+        return await client.download(vid, video=is_video)
+    except Exception as e:
+        logger.warning("Yuki download error for %s: %s", video_id_or_url, e)
         return None
 
-    vid = extract_video_id(video_id_or_url)
-    if not vid:
+
+async def _yuki_get_stream_link(video_id_or_url: str, is_video: bool = False) -> Optional[str]:
+    client = await _get_yuki_client()
+    if not client:
         return None
-
-    ext = "mp4" if is_video else "m4a"
-    filename = str(DOWNLOAD_DIR / f"{vid}.{ext}")
-
-    gateways = [YUKI_PRIMARY_URL, YUKI_BACKUP_URL]
-    for base in gateways:
-        if not base:
-            continue
-        stream_url = _yuki_stream_url(vid, base, is_video=is_video)
-        logger.info("Yuki download trying: %s (type: %s)", stream_url, "video" if is_video else "audio")
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    stream_url,
-                    timeout=aiohttp.ClientTimeout(total=300),
-                    allow_redirects=True,
-                ) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        logger.warning("Yuki HTTP %s via %s for %s: %s", resp.status, base, vid, text[:200])
-                        continue
-
-                    ctype = (resp.headers.get("Content-Type") or "").lower()
-                    # If API returns JSON (some deployments do), extract the direct link
-                    if "application/json" in ctype:
-                        try:
-                            data = await resp.json()
-                            link = data.get("url") or data.get("link") or data.get("stream") or data.get("stream_url")
-                            if link:
-                                if link.startswith("/"):
-                                    from urllib.parse import urljoin
-                                    link = urljoin(base, link)
-                                out = await _download_via_url_to_file(link, filename)
-                                if out:
-                                    return out
-                        except Exception as e:
-                            logger.debug("Yuki JSON parse error: %s", e)
-                        continue
-
-                    # Stream binary content directly to disk
-                    with open(filename, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(131072):
-                            if chunk:
-                                f.write(chunk)
-
-            if os.path.exists(filename) and os.path.getsize(filename) > 0:
-                size_mb = os.path.getsize(filename) / (1024 * 1024)
-                logger.info("Yuki download successful via %s: %s (%.2f MB)", base, filename, size_mb)
-                return filename
-            else:
-                logger.warning("Yuki download empty file via %s for %s", base, vid)
-        except Exception as e:
-            logger.warning("Yuki download error via %s for %s: %s", base, vid, e)
-            continue
-
-    logger.warning("Yuki: all gateways failed for %s", vid)
-    return None
+    try:
+        vid = extract_video_id(video_id_or_url)
+        return await client.get_stream_link(vid, video=is_video)
+    except Exception as e:
+        logger.warning("Yuki stream link error for %s: %s", video_id_or_url, e)
+        return None
 
 
 # ----------------- NubCoders provider ---------------------------------------------
@@ -602,7 +536,7 @@ class YouTube:
             logger.warning("NexGen download failed [yt/nexgen] for: %s", vid_for_file)
             return None
 
-        # 3) Yuki Music API (/yuki or /y or legacy /s, /shruti aliases)
+        # 3) Yuki Music API (/yuki or /yk, plus legacy /s, /shruti aliases)
         if mode in ("yuki", "yk", "shruti", "s"):
             out = await _yuki_download(vid_for_file, is_video=video)
             if out:
@@ -623,7 +557,7 @@ class YouTube:
             logger.warning("NubCoders download failed [nub] for: %s", vid_for_file)
             return None
 
-        # 5) Auto Mode (/auto) - Fallback Sequence: Telegram CDN -> Yuki -> NubCoders -> yt-dlp
+        # 5) Auto Mode (/auto) - Fallback: Telegram CDN -> Yuki -> NubCoders -> yt-dlp
         if mode == "auto":
             tg_file = await _tg_channel_download_by_id(vid_for_file, is_video=video)
             if tg_file:
@@ -652,7 +586,7 @@ class YouTube:
             logger.warning("All auto sources failed for: %s", vid_for_file)
             return None
 
-        # 6) Default Fallback
+        # 6) Default Fallback: NexGen -> Yuki -> TG CDN -> yt-dlp
         out = await _nexgen_download(vid_for_file, is_video=video)
         if out:
             if os.path.exists(out):

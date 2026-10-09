@@ -1,4 +1,3 @@
-# anony/helpers/_api.py
 import asyncio
 import re
 import aiofiles
@@ -99,7 +98,6 @@ class NexGenApi:
                     if status == "done":
                         if not dl_link:
                             return None
-                        # Downloads full CDN file locally
                         return await self.save_file(vid_id, dl_link, video)
                     elif status == "downloading":
                         await asyncio.sleep(4)
@@ -113,13 +111,10 @@ class NexGenApi:
 
 class YukiApi:
     """
-    Yuki Music API client (replaces ShrutiApi).
-
-    Gateways:
-      - primary: https://music.yukiapi.site  (audio default)
-      - backup:  https://play.yukiapi.site   (failover)
-
-    Stream endpoint: /stream/{VIDEO_ID}?key={KEY}&type=audio|video
+    Direct-stream API for:
+      https://music.yukiapi.site/stream/{VIDEO_ID}?key={API_KEY}&type=audio
+      https://play.yukiapi.site/stream/{VIDEO_ID}?key={API_KEY}&type=audio
+      https://music.yukiapi.site/stream/{VIDEO_ID}?key={API_KEY}&type=video
     """
 
     def __init__(
@@ -127,8 +122,8 @@ class YukiApi:
         api_key: str,
         primary_url: str = "https://music.yukiapi.site",
         backup_url: str = "https://play.yukiapi.site",
-        retries: int = 3,
-        timeout: int = 40,
+        retries: int = 5,
+        timeout: int = 60,
     ):
         self.api_key = api_key
         self.primary_url = primary_url.rstrip("/")
@@ -139,116 +134,45 @@ class YukiApi:
         self.retries = retries
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.session: aiohttp.ClientSession | None = None
-        self.headers = {"Accept": "*/*"}
+        self.headers = {"Accept": "application/json"}
 
     async def get_session(self) -> None:
         if not self.session:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
 
-    def _stream_url(self, vid_id: str, base: str, video: bool = False) -> str:
-        media_type = "video" if video else "audio"
-        return f"{base}/stream/{vid_id}?key={self.api_key}&type={media_type}"
-
-    async def get_stream_link(self, vid_id: str, video: bool = False) -> str | None:
-        """
-        Validate and return a working Yuki stream URL (primary, then backup).
-        Useful when you want to stream directly via PyTgCalls without downloading.
-        """
-        vid_id = extract_video_id(vid_id)
-        if not vid_id:
-            return None
-        await self.get_session()
-
-        for base in (self.primary_url, self.backup_url):
-            if not base:
-                continue
-            url = self._stream_url(vid_id, base, video)
-            try:
-                async with self.session.get(url, allow_redirects=True) as resp:
-                    if resp.status in (200, 206):
-                        return url
-            except Exception:
-                continue
-        return None
-
-    async def save_file(self, vid_id: str, url: str, video: bool = False) -> str | None:
-        """Stream a Yuki URL (or a JSON-provided direct link) to disk."""
-        try:
-            await self.get_session()
-            async with self.session.get(url, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    return None
-
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-
-                # Some Yuki deployments return {"url": "..."} JSON — resolve it
-                if "application/json" in ctype:
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        return None
-                    link = (
-                        data.get("url")
-                        or data.get("link")
-                        or data.get("stream")
-                        or data.get("stream_url")
-                    )
-                    if not link:
-                        return None
-                    if link.startswith("/"):
-                        from urllib.parse import urljoin
-                        link = urljoin(self.primary_url, link)
-                    return await self.save_file(vid_id, link, video)
-
-                file_name = None
-                cd = resp.headers.get("Content-Disposition")
-                if cd:
-                    match = re.search(r'filename="?(.+?)"?$', cd)
-                    if match:
-                        file_name = match.group(1)
-                if not file_name:
-                    file_name = vid_id + (".mp4" if video else ".m4a")
-
-                fname = f"downloads/{file_name}"
-                async with aiofiles.open(fname, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(self.chunk_limit):
-                        if chunk:
-                            await f.write(chunk)
-
-                if video:
-                    self.v_cache[vid_id] = fname
-                else:
-                    self.dl_cache[vid_id] = fname
-
-                return fname
-        except Exception:
-            pass
-        return None
-
     async def download(self, vid_id: str, video: bool = False) -> str | None:
+        """
+        Return the stream URL directly from Yuki API.
+        This is simpler and matches the API docs:
+        /stream/{VIDEO_ID}?key={KEY}&type=audio|video
+        """
         vid_id = extract_video_id(vid_id)
-        if not vid_id:
-            return None
-
         if video and vid_id in self.v_cache:
             return self.v_cache[vid_id]
         elif not video and vid_id in self.dl_cache:
             return self.dl_cache[vid_id]
 
         await self.get_session()
+        media_type = "video" if video else "audio"
 
-        # Failover: primary -> backup, retry each a few times
-        for base in (self.primary_url, self.backup_url):
-            if not base:
-                continue
-            url = self._stream_url(vid_id, base, video)
-            for _ in range(self.retries):
-                try:
-                    saved = await self.save_file(vid_id, url, video)
-                    if saved:
-                        return saved
-                    # Non-200 or empty body — try next retry/base
-                except Exception:
-                    await asyncio.sleep(2)
-                    continue
+        urls = [
+            f"{self.primary_url}/stream/{vid_id}?key={self.api_key}&type={media_type}",
+            f"{self.backup_url}/stream/{vid_id}?key={self.api_key}&type={media_type}",
+        ]
+
+        for idx, stream_url in enumerate(urls):
+            try:
+                async with self.session.get(stream_url, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        if not video and vid_id not in self.dl_cache:
+                            self.dl_cache[vid_id] = stream_url
+                        if video and vid_id not in self.v_cache:
+                            self.v_cache[vid_id] = stream_url
+                        return stream_url
+            except Exception:
+                pass
+
+            if idx == len(urls) - 1:
+                return None
+
         return None
